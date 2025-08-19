@@ -52,6 +52,7 @@ type Queue struct {
 	mu                             sync.Mutex
 	connIsOwned                    bool
 	deqOptsTainted, enqOptsTainted bool
+	isJSONQueue                    bool
 }
 
 type queueOption interface{ qOption() }
@@ -88,17 +89,27 @@ func NewQueue(ctx context.Context, execer Execer, name string, payloadObjectType
 	Q := Queue{conn: cx.(*conn), name: name, connIsOwned: execerIsPool}
 
 	var payloadType *C.dpiObjectType
-	if payloadObjectTypeName != "" {
+	var isJSONQueue bool
+	
+	// Detect JSON queue - either explicit "JSON" or check for JSON payload type
+	if payloadObjectTypeName == "JSON" {
+		isJSONQueue = true
+	} else if payloadObjectTypeName != "" {
 		ot, err := Q.conn.GetObjectType(payloadObjectTypeName)
 		if err != nil {
 			return nil, err
 		}
 		Q.PayloadObjectType, payloadType = ot, ot.dpiObjectType
 	}
+	
+	Q.isJSONQueue = isJSONQueue
 	value := C.CString(name)
+	
+	// Use regular queue creation function - JSON detection happens at message level
 	err = Q.conn.checkExec(func() C.int {
 		return C.dpiConn_newQueue(Q.conn.dpiConn, value, C.uint(len(name)), payloadType, &Q.dpiQueue)
 	})
+	
 	C.free(unsafe.Pointer(value))
 	if err != nil {
 		cx.Close()
@@ -429,6 +440,7 @@ func (Q *Queue) EnqueueWithOptions(messages []Message, opts *EnqOptions) error {
 type Message struct {
 	Enqueued                time.Time
 	Object                  *Object
+	JSON                    *JSON
 	Correlation, ExceptionQ string
 	Raw                     []byte
 	Delay, Expiration       time.Duration
@@ -442,7 +454,7 @@ func (M Message) IsZero() bool {
 	return M.Correlation == "" && M.ExceptionQ == "" && M.Enqueued.IsZero() &&
 		M.MsgID == zeroMsgID && M.OriginalMsgID == zeroMsgID && len(M.Raw) == 0 &&
 		M.Delay == 0 && M.Expiration == 0 && M.Priority == 0 && M.NumAttempts == 0 &&
-		M.Object == nil && M.State == 0
+		M.Object == nil && M.JSON == nil && M.State == 0
 }
 
 // Deadline return the message's intended deadline: enqueue time + delay + expiration.
@@ -485,10 +497,16 @@ func (M *Message) toOra(d *drv, props *C.dpiMsgProps) error {
 
 	OK(C.dpiMsgProps_setPriority(props, C.int(M.Priority)), "setPriority")
 
-	if M.Object == nil {
-		OK(C.dpiMsgProps_setPayloadBytes(props, (*C.char)(unsafe.Pointer(&M.Raw[0])), C.uint(len(M.Raw))), "setPayloadBytes")
-	} else {
+	// Handle different payload types
+	if M.JSON != nil {
+		// JSON payload
+		OK(C.dpiMsgProps_setPayloadJson(props, M.JSON.dpiJson), "setPayloadJson")
+	} else if M.Object != nil {
+		// Object payload
 		OK(C.dpiMsgProps_setPayloadObject(props, M.Object.dpiObject), "setPayloadObject")
+	} else if len(M.Raw) > 0 {
+		// RAW payload
+		OK(C.dpiMsgProps_setPayloadBytes(props, (*C.char)(unsafe.Pointer(&M.Raw[0])), C.uint(len(M.Raw))), "setPayloadBytes")
 	}
 
 	return firstErr
@@ -578,18 +596,31 @@ func (M *Message) fromOra(c *conn, props *C.dpiMsgProps, objType *ObjectType) er
 
 	M.Raw = nil
 	M.Object = nil
-	var obj *C.dpiObject
-	if OK(C.dpiMsgProps_getPayload(props, &obj, &value, &length), "getPayload") {
-		if obj == nil {
-			M.Raw = C.GoBytes(unsafe.Pointer(value), C.int(length))
-		} else {
-			if C.dpiObject_addRef(obj) == C.DPI_FAILURE {
-				return objType.drv.getError()
+	M.JSON = nil
+	
+	// Try to get JSON payload first
+	var jsonObj *C.dpiJson
+	if OK(C.dpiMsgProps_getPayloadJson(props, &jsonObj), "getPayloadJson") && jsonObj != nil {
+		// JSON payload
+		if C.dpiJson_addRef(jsonObj) == C.DPI_FAILURE {
+			return c.getError()
+		}
+		M.JSON = &JSON{dpiJson: jsonObj, stringOption: JSONOptDefault}
+	} else {
+		// Try regular payload (object or raw)
+		var obj *C.dpiObject
+		if OK(C.dpiMsgProps_getPayload(props, &obj, &value, &length), "getPayload") {
+			if obj == nil {
+				M.Raw = C.GoBytes(unsafe.Pointer(value), C.int(length))
+			} else {
+				if C.dpiObject_addRef(obj) == C.DPI_FAILURE {
+					return objType.drv.getError()
+				}
+				M.Object = &Object{dpiObject: obj, ObjectType: objType}
 			}
-			M.Object = &Object{dpiObject: obj, ObjectType: objType}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (M *Message) writeMsgID(value *C.char, length C.uint) {
