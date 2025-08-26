@@ -23,6 +23,11 @@ import (
 
 const MsgIDLength = 16
 
+const (
+	// JSONPayloadType signals that the queue carries native JSON payloads.
+	JSONPayloadType = "JSON"
+)
+
 var zeroMsgID [MsgIDLength]byte
 
 // DefaultEnqOptions is the default set for NewQueue.
@@ -50,7 +55,7 @@ type Queue struct {
 	defEnqOpts                     EnqOptions
 	props                          []*C.dpiMsgProps
 	mu                             sync.Mutex
-	connIsOwned                    bool
+	connIsOwned,isJSON             bool
 	deqOptsTainted, enqOptsTainted bool
 }
 
@@ -88,18 +93,29 @@ func NewQueue(ctx context.Context, execer Execer, name string, payloadObjectType
 	Q := Queue{conn: cx.(*conn), name: name, connIsOwned: execerIsPool}
 
 	var payloadType *C.dpiObjectType
-	if payloadObjectTypeName != "" {
-		ot, err := Q.conn.GetObjectType(payloadObjectTypeName)
-		if err != nil {
-			return nil, err
+	if payloadObjectTypeName == JSONPayloadType {
+		Q.isJSON = true
+		// create JSON queue handle
+		cName := C.CString(name)
+		err = Q.conn.checkExec(func() C.int {
+			return C.dpiConn_newJsonQueue(Q.conn.dpiConn, cName, C.uint(len(name)), &Q.dpiQueue)
+		})
+		C.free(unsafe.Pointer(cName))
+	} else {
+		if payloadObjectTypeName != "" {
+			ot, err := Q.conn.GetObjectType(payloadObjectTypeName)
+			if err != nil {
+				cx.Close()
+				return nil, err
+			}
+			Q.PayloadObjectType, payloadType = ot, ot.dpiObjectType
 		}
-		Q.PayloadObjectType, payloadType = ot, ot.dpiObjectType
-	}
-	value := C.CString(name)
-	err = Q.conn.checkExec(func() C.int {
-		return C.dpiConn_newQueue(Q.conn.dpiConn, value, C.uint(len(name)), payloadType, &Q.dpiQueue)
-	})
-	C.free(unsafe.Pointer(value))
+        cName := C.CString(name)
+		err = Q.conn.checkExec(func() C.int {
+			return C.dpiConn_newQueue(Q.conn.dpiConn, cName, C.uint(len(name)), payloadType, &Q.dpiQueue)
+		})
+		C.free(unsafe.Pointer(cName))
+    }
 	if err != nil {
 		cx.Close()
 		return nil, fmt.Errorf("newQueue %q: %w", name, err)
@@ -198,7 +214,7 @@ func (Q *Queue) EnqOptions() (EnqOptions, error) {
 	if err := Q.conn.checkExec(func() C.int { return C.dpiQueue_getEnqOptions(Q.dpiQueue, &opts) }); err != nil {
 		return E, fmt.Errorf("getEnqOptions: %w", err)
 	}
-	err := E.fromOra(Q.conn.drv, opts)
+	err := E.fromOra(Q.conn.drv, opts, Q.isJSON)
 	return E, err
 }
 
@@ -211,6 +227,21 @@ func (Q *Queue) DeqOptions() (DeqOptions, error) {
 	}
 	err := D.fromOra(Q.conn.drv, opts)
 	return D, err
+}
+
+//-----------------------------------------------------------------------------
+// Dequeue helpers
+//-----------------------------------------------------------------------------
+func (Q *Queue) DequeueJSON(wait time.Duration) (any, error) {
+	var m Message
+	if err := Q.SetDeqOptions(DeqOptions{Wait: wait}); err != nil {
+		return nil, err
+	}
+	n, err := Q.DequeueWithOptions([]Message{m}, nil)
+	if err != nil || n == 0 {
+		return nil, err
+	}
+	return m.JSON, nil
 }
 
 // Dequeues messages into the given slice.
@@ -290,7 +321,7 @@ func (Q *Queue) DequeueWithOptions(messages []Message, opts *DeqOptions) (int, e
 
 	var firstErr error
 	for i, p := range props[:int(num)] {
-		if err := messages[i].fromOra(Q.conn, p, Q.PayloadObjectType); err != nil {
+		if err := messages[i].fromOra(Q.conn, p, Q.PayloadObjectType, Q.isJSON); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -323,6 +354,9 @@ func (Q *Queue) start() error {
 	return Q.execQ(ctx, `BEGIN DBMS_AQADM.start_queue(queue_name=>:1); END;`)
 }
 
+func (Q *Queue) EnqueueJSON(v *JSON) error {
+	return Q.EnqueueWithOptions([]Message{{JSON: v}}, nil)
+}
 // Enqueue all the messages given.
 //
 // WARNING: calling this function in parallel on different connections acquired from the same pool may fail due to Oracle bug 29928074.
@@ -376,7 +410,7 @@ func (Q *Queue) EnqueueWithOptions(messages []Message, opts *EnqOptions) error {
 		if C.dpiConn_newMsgProps(Q.conn.dpiConn, &props[i]) == C.DPI_FAILURE {
 			return fmt.Errorf("newMsgProps: %w", Q.conn.getError())
 		}
-		if err := m.toOra(Q.conn.drv, props[i]); err != nil {
+		if err := m.toOra(Q.conn, props[i], Q.isJSON); err != nil {
 			return err
 		}
 	}
@@ -436,6 +470,7 @@ type Message struct {
 	State                   MessageState
 	Priority, NumAttempts   int32
 	MsgID, OriginalMsgID    [16]byte
+	JSON                    *JSON
 }
 
 func (M Message) IsZero() bool {
@@ -452,7 +487,42 @@ func (M Message) Deadline() time.Time {
 	}
 	return M.Enqueued.Add(M.Delay + M.Expiration)
 }
-func (M *Message) toOra(d *drv, props *C.dpiMsgProps) error {
+
+// toOraJSON sets a native-JSON payload on props.
+// It allocates a dpiJson handle, writes the Go value as text,
+// then passes the handle to dpiMsgProps_setPayloadJson.
+// Caller must C.dpiJson_release(json) after enqueue call returns.
+func toOraJSON(c *conn, props *C.dpiMsgProps, data []byte) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// 1. Ensure non-empty JSON text
+	if len(data) == 0 { // Oracle JSON cannot be empty
+		data = []byte("{}")
+	}
+
+	// 2. Create dpiJson handle
+	var j *C.dpiJson
+	if C.dpiConn_newJson(c.dpiConn, &j) == C.DPI_FAILURE {
+		return c.getError()
+	}
+	defer C.dpiJson_release(j) // safety; props_set takes its own ref
+
+	// 3. Populate json from text
+	cText := (*C.char)(unsafe.Pointer(&data[0]))
+	if C.dpiJson_setFromText(j, cText, C.uint64_t(len(data)), 0) == C.DPI_FAILURE {
+		return c.getError()
+	}
+
+	// 4. Set as payload
+	if C.dpiMsgProps_setPayloadJson(props, j) == C.DPI_FAILURE {
+		return c.getError()
+	}
+	return nil
+}
+
+
+func (M *Message) toOra(c *conn, props *C.dpiMsgProps, isJSON bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -462,9 +532,26 @@ func (M *Message) toOra(d *drv, props *C.dpiMsgProps) error {
 			return
 		}
 		if firstErr == nil {
-			firstErr = fmt.Errorf("%s: %w", name, d.getError())
+			firstErr = fmt.Errorf("%s: %w", name, c.getError())
 		}
 	}
+    
+	if isJSON {
+		if M.JSON != nil {
+			// Convert driver JSON to text and enqueue natively
+			str, err := M.JSON.StringWithOption(JSONOptDefault)
+			if err != nil {
+				return err
+			}
+			return toOraJSON(c, props, []byte(str))
+		}
+		// Fallback: if Raw contains JSON text, enqueue as native JSON
+		if len(M.Raw) > 0 && (M.Raw[0] == '{' || M.Raw[0] == '[') {
+			return toOraJSON(c, props, M.Raw)
+		}
+		// else: fall through to non-JSON path
+	}
+
 	if M.Correlation != "" {
 		value := C.CString(M.Correlation)
 		OK(C.dpiMsgProps_setCorrelation(props, value, C.uint(len(M.Correlation))), "setCorrelation")
@@ -494,7 +581,41 @@ func (M *Message) toOra(d *drv, props *C.dpiMsgProps) error {
 	return firstErr
 }
 
-func (M *Message) fromOra(c *conn, props *C.dpiMsgProps, objType *ObjectType) error {
+// fromOraJSON extracts a native JSON payload from props into M.JSON.
+// objType is ignored (used only for object queues).
+func fromOraJSON(c *conn, props *C.dpiMsgProps, M *Message) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// 1. Get dpiJson* handle
+	var j *C.dpiJson
+	if C.dpiMsgProps_getPayloadJson(props, &j) == C.DPI_FAILURE {
+		return c.getError()
+	}
+	if j == nil {
+		// Fallback: try to read as bytes/object payload
+		var obj *C.dpiObject
+		var value *C.char
+		var length C.uint
+		if C.dpiMsgProps_getPayload(props, &obj, &value, &length) == C.DPI_FAILURE {
+			return c.getError()
+		}
+		if obj == nil && value != nil && length > 0 {
+			M.Raw = C.GoBytes(unsafe.Pointer(value), C.int(length))
+		}
+		return nil
+	}
+	// Store native JSON handle for caller; caller can use GetValue/String
+	M.JSON = &JSON{dpiJson: j}
+	// Also populate Raw with JSON text for compatibility/logging
+	if s, err := M.JSON.StringWithOption(JSONOptDefault); err == nil {
+		M.Raw = []byte(s)
+	}
+	return nil
+}
+
+
+func (M *Message) fromOra(c *conn, props *C.dpiMsgProps, objType *ObjectType, isJSON bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -575,7 +696,9 @@ func (M *Message) fromOra(c *conn, props *C.dpiMsgProps, objType *ObjectType) er
 	if OK(C.dpiMsgProps_getState(props, &state), "getState") {
 		M.State = MessageState(state)
 	}
-
+    if isJSON {
+		return fromOraJSON(c, props, M)
+	}
 	M.Raw = nil
 	M.Object = nil
 	var obj *C.dpiObject
@@ -612,7 +735,7 @@ type EnqOptions struct {
 
 func (EnqOptions) qOption() {}
 
-func (E *EnqOptions) fromOra(d *drv, opts *C.dpiEnqOptions) error {
+func (E *EnqOptions) fromOra(d *drv, opts *C.dpiEnqOptions, isJSON bool) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 

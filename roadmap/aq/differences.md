@@ -34,9 +34,9 @@ Findings
 - python-oracledb notes MSG_BUFFERED not supported for bulk in Thick mode; godror has no explicit guard (server will enforce).
 
 Summary of gaps to close first
-- JSON AQ support (queue open + payload set/get).
-- Recipient lists on messages.
-- AQ namespace subscriptions.
+- JSON AQ support (queue open + payload set/get). ------------------ Important to verify
+- Recipient lists on messages.                    ------------------ Is not backported for teq
+- AQ namespace subscriptions.                     ------------------ Not on priority
 - TEQ-safe operations (avoid Classic-only procedures; document/guard unsupported combos).
 
 
